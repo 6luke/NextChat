@@ -3,10 +3,16 @@ import {
   ApiPath,
   ByteDance,
   BYTEDANCE_BASE_URL,
-  REQUEST_TIMEOUT_MS,
+  REQUEST_TIMEOUT_MS_FOR_THINKING,
 } from "@/app/constant";
-import { useAccessStore, useAppConfig, useChatStore } from "@/app/store";
-
+import {
+  useAccessStore,
+  useAppConfig,
+  useChatStore,
+  ChatMessageTool,
+  usePluginStore,
+} from "@/app/store";
+import { streamWithThink } from "@/app/utils/chat";
 import {
   ChatOptions,
   getHeaders,
@@ -15,14 +21,11 @@ import {
   MultimodalContent,
   SpeechOptions,
 } from "../api";
-import Locale from "../../locales";
 import {
-  EventStreamContentType,
-  fetchEventSource,
-} from "@fortaine/fetch-event-source";
-import { prettyObject } from "@/app/utils/format";
+  getMessageTextContent,
+  getMessageTextContentWithoutThinking,
+} from "@/app/utils";
 import { getClientConfig } from "@/app/config/client";
-import { preProcessImageContent } from "@/app/utils/chat";
 import { fetch } from "@/app/utils/stream";
 
 export interface OpenAIListModelResponse {
@@ -86,8 +89,13 @@ export class DoubaoApi implements LLMApi {
   async chat(options: ChatOptions) {
     const messages: ChatOptions["messages"] = [];
     for (const v of options.messages) {
-      const content = await preProcessImageContent(v.content);
-      messages.push({ role: v.role, content });
+      if (v.role === "assistant") {
+        const content = getMessageTextContentWithoutThinking(v);
+        messages.push({ role: v.role, content });
+      } else {
+        const content = getMessageTextContent(v);
+        messages.push({ role: v.role, content });
+      }
     }
 
     const modelConfig = {
@@ -95,20 +103,25 @@ export class DoubaoApi implements LLMApi {
       ...useChatStore.getState().currentSession().mask.modelConfig,
       ...{
         model: options.config.model,
+        providerName: options.config.providerName,
       },
     };
 
-    const shouldStream = !!options.config.stream;
     const requestPayload: RequestPayload = {
       messages,
-      stream: shouldStream,
+      stream: options.config.stream,
       model: modelConfig.model,
       temperature: modelConfig.temperature,
       presence_penalty: modelConfig.presence_penalty,
       frequency_penalty: modelConfig.frequency_penalty,
       top_p: modelConfig.top_p,
+      // max_tokens: Math.max(modelConfig.max_tokens, 1024),
+      // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
     };
 
+    console.log("[Request] openai payload: ", requestPayload);
+
+    const shouldStream = !!options.config.stream;
     const controller = new AbortController();
     options.onController?.(controller);
 
@@ -121,122 +134,105 @@ export class DoubaoApi implements LLMApi {
         headers: getHeaders(),
       };
 
-      // make a fetch request
+      // console.log(chatPayload);
+
+      // Use extended timeout for thinking models as they typically require more processing time
       const requestTimeoutId = setTimeout(
         () => controller.abort(),
-        REQUEST_TIMEOUT_MS,
+        REQUEST_TIMEOUT_MS_FOR_THINKING,
       );
 
       if (shouldStream) {
-        let responseText = "";
-        let remainText = "";
-        let finished = false;
-        let responseRes: Response;
-
-        // animate response to make it looks smooth
-        function animateResponseText() {
-          if (finished || controller.signal.aborted) {
-            responseText += remainText;
-            console.log("[Response Animation] finished");
-            if (responseText?.length === 0) {
-              options.onError?.(new Error("empty response from server"));
+        const [tools, funcs] = usePluginStore
+          .getState()
+          .getAsTools(
+            useChatStore.getState().currentSession().mask?.plugin || [],
+          );
+        return streamWithThink(
+          chatPath,
+          requestPayload,
+          getHeaders(),
+          tools as any,
+          funcs,
+          controller,
+          // parseSSE
+          (text: string, runTools: ChatMessageTool[]) => {
+            // console.log("parseSSE", text, runTools);
+            const json = JSON.parse(text);
+            const choices = json.choices as Array<{
+              delta: {
+                content: string | null;
+                tool_calls: ChatMessageTool[];
+                reasoning_content: string | null;
+              };
+            }>;
+            const tool_calls = choices[0]?.delta?.tool_calls;
+            if (tool_calls?.length > 0) {
+              const index = tool_calls[0]?.index;
+              const id = tool_calls[0]?.id;
+              const args = tool_calls[0]?.function?.arguments;
+              if (id) {
+                runTools.push({
+                  id,
+                  type: tool_calls[0]?.type,
+                  function: {
+                    name: tool_calls[0]?.function?.name as string,
+                    arguments: args,
+                  },
+                });
+              } else {
+                // @ts-ignore
+                runTools[index]["function"]["arguments"] += args;
+              }
             }
-            return;
-          }
+            const reasoning = choices[0]?.delta?.reasoning_content;
+            const content = choices[0]?.delta?.content;
 
-          if (remainText.length > 0) {
-            const fetchCount = Math.max(1, Math.round(remainText.length / 60));
-            const fetchText = remainText.slice(0, fetchCount);
-            responseText += fetchText;
-            remainText = remainText.slice(fetchCount);
-            options.onUpdate?.(responseText, fetchText);
-          }
-
-          requestAnimationFrame(animateResponseText);
-        }
-
-        // start animaion
-        animateResponseText();
-
-        const finish = () => {
-          if (!finished) {
-            finished = true;
-            options.onFinish(responseText + remainText, responseRes);
-          }
-        };
-
-        controller.signal.onabort = finish;
-
-        fetchEventSource(chatPath, {
-          fetch: fetch as any,
-          ...chatPayload,
-          async onopen(res) {
-            clearTimeout(requestTimeoutId);
-            const contentType = res.headers.get("content-type");
-            console.log(
-              "[ByteDance] request response content type: ",
-              contentType,
-            );
-            responseRes = res;
-            if (contentType?.startsWith("text/plain")) {
-              responseText = await res.clone().text();
-              return finish();
-            }
-
+            // Skip if both content and reasoning_content are empty or null
             if (
-              !res.ok ||
-              !res.headers
-                .get("content-type")
-                ?.startsWith(EventStreamContentType) ||
-              res.status !== 200
+              (!reasoning || reasoning.length === 0) &&
+              (!content || content.length === 0)
             ) {
-              const responseTexts = [responseText];
-              let extraInfo = await res.clone().text();
-              try {
-                const resJson = await res.clone().json();
-                extraInfo = prettyObject(resJson);
-              } catch {}
-
-              if (res.status === 401) {
-                responseTexts.push(Locale.Error.Unauthorized);
-              }
-
-              if (extraInfo) {
-                responseTexts.push(extraInfo);
-              }
-
-              responseText = responseTexts.join("\n\n");
-
-              return finish();
+              return {
+                isThinking: false,
+                content: "",
+              };
             }
-          },
-          onmessage(msg) {
-            if (msg.data === "[DONE]" || finished) {
-              return finish();
+
+            if (reasoning && reasoning.length > 0) {
+              return {
+                isThinking: true,
+                content: reasoning,
+              };
+            } else if (content && content.length > 0) {
+              return {
+                isThinking: false,
+                content: content,
+              };
             }
-            const text = msg.data;
-            try {
-              const json = JSON.parse(text);
-              const choices = json.choices as Array<{
-                delta: { content: string };
-              }>;
-              const delta = choices[0]?.delta?.content;
-              if (delta) {
-                remainText += delta;
-              }
-            } catch (e) {
-              console.error("[Request] parse error", text, msg);
-            }
+
+            return {
+              isThinking: false,
+              content: "",
+            };
           },
-          onclose() {
-            finish();
+          // processToolMessage, include tool_calls message and tool call results
+          (
+            requestPayload: RequestPayload,
+            toolCallMessage: any,
+            toolCallResult: any[],
+          ) => {
+            // @ts-ignore
+            requestPayload?.messages?.splice(
+              // @ts-ignore
+              requestPayload?.messages?.length,
+              0,
+              toolCallMessage,
+              ...toolCallResult,
+            );
           },
-          onerror(e) {
-            options.onError?.(e);
-            throw e;
-          },
-          openWhenHidden: true,
-        });
+          options,
+        );
       } else {
         const res = await fetch(chatPath, chatPayload);
         clearTimeout(requestTimeoutId);
